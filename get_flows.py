@@ -7,7 +7,6 @@ import numpy as np
 import pandas as pd
 
 base_dir = '/home/work/m3f/ctu13/'
-services = {'http', 'dns', 'ssl', 'tcp'}
 ignore_domain = {'time.windows.com', 'www.download.windowsupdate.com',
                  'windowsupdate.microsoft.com', }
 
@@ -112,8 +111,6 @@ for target_label in filenames:
             service = item['service']
         else:
             service = item['proto']
-        if service not in services:
-            continue
         if 'orig_bytes' not in item or 'resp_bytes' not in item:
             continue
         if item['orig_bytes'] == 0 and item['resp_bytes'] == 0:
