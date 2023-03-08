@@ -1,35 +1,97 @@
 # -*- coding: utf-8 -*-
 from __future__ import print_function
 import os
+import argparse
+import sys
 import json
 import re
+import math
 import numpy as np
-import pandas as pd
+from collections import defaultdict
+from tqdm import tqdm
 
-base_dir = '/home/work/m3f/ctu13/'
-ignore_domain = {'time.windows.com', 'www.download.windowsupdate.com',
-                 'windowsupdate.microsoft.com', }
 
-filenames = ['Zeus', 'Yakes', 'Artemis', 'Andromeda',
-             'Sality', 'CCleaner', 'MinerTrojan', 'OpenCandy']
-time_delta = 120
-for target_label in filenames:
-    data = {'path': [], 'ip': [], 'flow': []}
+def norm(num):
+    zero = 1
+    while num > 10:
+        num /= 10
+        zero *= 10
+    return int(num) * zero
 
-    filename = os.path.join(base_dir, target_label)
 
-    full_path = filename + '.conn.log'
-    if not os.path.exists(full_path):
-        continue
-    dns_full_path = filename + '.dns.log'
+def flow2status(flow):
+    if flow['service'] == 'dns':
+        if 'qtype' not in flow:
+            flow['qtype'] = 1
+        return '{}-{}-{}'.format(flow['service'], flow['qtype'], len(flow['answers']))
+    return flow['service'], norm(flow['orig_bytes']), norm(flow['resp_bytes'])
+
+
+def train(train_data):
+    trans_matrix = {}
+    for seq in train_data:
+        for idx in range(1, len(seq) - 1):
+            current_status = seq[idx]
+            next_status = seq[idx + 1]
+            if current_status not in trans_matrix:
+                trans_matrix[current_status] = {}
+            if next_status not in trans_matrix[current_status]:
+                trans_matrix[current_status][next_status] = 0
+            trans_matrix[current_status][next_status] += 1
+    for current_status in trans_matrix:
+        total = 0
+        for next_status in trans_matrix[current_status]:
+            total += trans_matrix[current_status][next_status]
+        for next_status in trans_matrix[current_status]:
+            trans_matrix[current_status][next_status] /= total
+    return trans_matrix
+
+
+def sim(status, status_):
+    if type(status) == tuple and type(status_) == tuple:
+        if status_[0] != status[0]:
+            return 0
+        sim_prob = ((status[2] - status_[2]) ** 2 + (status[1] - status_[1]) ** 2) / (status[2] ** 2 + status[1] ** 2)
+        sim_prob = np.clip(1 - math.sqrt(sim_prob), 0, 1)
+        return sim_prob
+    else:
+        return 1 if status_ == status else 0
+
+
+def get_prob(seq, trans_matrix):
+    prob = 1
+    for idx in range(1, len(seq) - 1):
+        current_status = seq[idx]
+        next_status = seq[idx + 1]
+        if current_status in trans_matrix:
+            max_prob = 0
+            for status in trans_matrix[current_status]:
+                trans_prob = sim(status, next_status) * trans_matrix[current_status][status]
+                if max_prob < trans_prob:
+                    max_prob = trans_prob
+            prob *= max_prob
+        else:
+            prob *= 0
+    return prob
+
+
+def merge(dir_path):
+    services = {'http', 'dns', 'ssl', 'tcp'}
+    ignore_domain = {'time.windows.com', 'www.download.windowsupdate.com',
+                     'windowsupdate.microsoft.com', }
+    sequences = defaultdict(list)
+    time_delta = 120
+    full_path = os.path.join(dir_path, 'conn.log')
+    dns_full_path = os.path.join(dir_path, 'dns.log')
     fr = open(dns_full_path)
     dns_lines = fr.readlines()
     fr.close()
+
     dns_flows = {}
     ip2id = {}
     ignore_ip = set()
     domain2id = {}
-    for line in dns_lines:
+    for line in tqdm(dns_lines, desc='dns'):
         item = json.loads(line)
         if 'qtype' not in item or item['qtype'] != 1:
             continue
@@ -65,7 +127,7 @@ for target_label in filenames:
                 continue
             ip2id[a] = idx
 
-    http_full_path = filename + '.http.log'
+    http_full_path = os.path.join(dir_path, 'http.log')
     if os.path.exists(http_full_path):
         fr = open(http_full_path)
         http_lines = fr.readlines()
@@ -78,8 +140,7 @@ for target_label in filenames:
     conn_lines = conn_lines + dns_lines + http_lines
     fr.close()
     flows = {}
-    cnt = 0
-    for line in conn_lines:
+    for line in tqdm(conn_lines, desc='logs'):
         item = json.loads(line)
         if 'service' in item and item['service'] == 'http':
             continue
@@ -111,6 +172,8 @@ for target_label in filenames:
             service = item['service']
         else:
             service = item['proto']
+        if service not in services:
+            continue
         if 'orig_bytes' not in item or 'resp_bytes' not in item:
             continue
         if item['orig_bytes'] == 0 and item['resp_bytes'] == 0:
@@ -141,37 +204,22 @@ for target_label in filenames:
         else:
             id2ip[ip2id[ip]] += ';' + ip
 
-    max_cnt = 2
-    max_cnt_key = ''
-    length = {}
     for key in flows:
         if len(flows[key]) <= 1:
             continue
-        if max_cnt < len(flows[key]):
-            max_cnt = len(flows[key])
-            max_cnt_key = key
         flows[key] = sorted(flows[key].values(), key=lambda flow: flow['ts'])
         last_ts = flows[key][0]['ts']
-        split_by_time = {}
-        split_key = '{}-{}'.format(key, last_ts)
-        split_by_time[split_key] = []
-
-        last_ts = flows[key][0]['ts']
         ip_key = '{}-{}'.format(id2ip[key], last_ts)
+        if ip_key not in sequences:
+            sequences[ip_key].append('S')
         for item in flows[key]:
             if item['ts'] - last_ts > time_delta:
                 last_ts = item['ts']
                 ip_key = '{}-{}'.format(id2ip[key], last_ts)
-            data['path'].append(filename)
-            data['ip'].append(ip_key)
-            data['flow'].append(json.dumps(item))
-            if ip_key not in length:
-                length[ip_key] = 0
-            length[ip_key] += 1
+                if ip_key not in sequences:
+                    sequences[ip_key].append('S')
+            sequences[ip_key].append(flow2status(item))
             last_ts = item['ts']
-    length = np.array(list(length.values()))
-    print('mean: ', np.mean(length), 'min: ', np.min(length),
-          'max: ', np.max(length), 'total: ', len(length), 'seq: ', np.sum(length > 1))
-    df = pd.DataFrame(data)
-    df.to_csv('{}/{}.csv'.format(base_dir, target_label), index_label='id')
-    print(target_label, len(data['ip']), len(conn_lines), time_delta)
+    for key in sequences:
+        sequences[key].append('E')
+    return sequences
